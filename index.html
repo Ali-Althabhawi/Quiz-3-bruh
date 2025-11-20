@@ -1,0 +1,857 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Blob Classifer (MLP)</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;padding:16px;color:#111;background:#f7f8fa;display:flex;justify-content:center}
+    .page{width:100%;max-width:1320px}
+    h1{margin:0 0 14px;font-weight:600}
+    .controlsRow{display:flex;flex-direction:column;gap:12px;margin-bottom:12px}
+    .controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;padding:16px;background:#fff;border-radius:14px;box-shadow:0 10px 26px rgba(20,20,40,0.08)}
+    label{display:block;font-size:13px;margin-top:6px}
+    input,select,button{width:100%;padding:6px;margin-top:4px;box-sizing:border-box}
+    canvas{background:#ffffff;border-radius:12px;border:1px solid #e6e9ef;display:block;width:100%;max-width:900px;height:auto;margin:0 auto;box-shadow:0 12px 32px rgba(20,20,40,0.09)}
+    .status{margin:8px 0;font-weight:600;color:#1f2d3d}
+    .topbar{grid-column:1/-1;display:flex;justify-content:space-between;align-items:center;margin-top:6px;padding:10px 14px;border-radius:10px;background:#f8fafc;color:#111827;font-weight:600;box-shadow:inset 0 0 0 1px rgba(37,99,235,0.08)}
+    .small{font-size:13px;color:#6b7280}
+    .controls .buttons{display:flex;gap:8px;flex-wrap:wrap}
+    .controls .buttons button{flex:1 1 140px}
+    button{background:#2563eb;color:#fff;border:none;padding:8px 10px;border-radius:6px;cursor:pointer;box-shadow:0 4px 10px rgba(37,99,235,0.12)}
+    button.secondary{background:#fff;color:#374151;border:1px solid #e5e7eb;box-shadow:none}
+    input,select{border:1px solid #e5e7eb;border-radius:6px}
+    @media (max-width:720px){
+      .controls{grid-template-columns:1fr;padding:14px}
+      .topbar{flex-direction:column;align-items:flex-start;gap:6px}
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>Blob Classifer (MLP)</h1>
+
+    <!-- Controls moved to top -->
+    <div class="controlsRow">
+      <div class="controls">
+        <label>Hidden layers (comma separated)
+          <input id="hiddenLayers" placeholder="e.g. 8,8 or leave empty for none" />
+        </label>
+
+        <label>Learning rate
+          <input id="lr" type="number" step="0.0001" value="0.1" />
+        </label>
+
+        <label>Epochs
+          <input id="epochs" type="number" value="200" />
+        </label>
+
+        <label>Points per class
+          <input id="pointsPerClass" type="number" value="200" />
+        </label>
+
+        <label>Variance (mixing)
+          <input id="variance" type="number" step="0.01" value="0.25" />
+        </label>
+
+        <label>Dataset
+          <select id="dataset">
+            <option value="quadrant">Quadrant blob (4 class)</option>
+            <option value="moon">Moon (2 class)</option>
+            <option value="diagonal">Diagonal (3 class)</option>
+          </select>
+        </label>
+
+        <label>Moon gap (0..1 — smaller = more overlap; moves top arc down and bottom arc up, does not change horizontal centers)
+          <input id="moongap" type="number" min="0" max="1" step="0.01" value="0.5" />
+        </label>
+
+        <div class="buttons" style="margin-top:10px">
+          <button id="trainBtn">Train</button>
+          <button id="pauseBtn">Pause</button>
+          <button id="stopBtn">Stop</button>
+        </div>
+
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button id="applyHidden" class="secondary">Apply Hidden Layers</button>
+          <button id="generateBtn" class="secondary">Generate Data</button>
+          <button id="resetBtn" class="secondary">Reset</button>
+        </div>
+
+        <div class="status small" id="status">Epoch: 0/0 &nbsp; Loss: 0.00</div>
+        <div class="small" id="debugPanel" style="margin-top:6px;color:#9aa4b2">Debug: waiting...</div>
+        <div class="small">Tip: change hidden layers and press "Apply Hidden Layers" to reinitialize.</div>
+
+        <div class="topbar">
+          <div id="epochInfo">Epoch 0/0</div>
+          <div id="lossInfo">Loss: 0.00</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Large graph below controls -->
+    <div>
+      <canvas id="plot" width="960" height="640"></canvas>
+    </div>
+  </div>
+
+  <script>
+  // Main thread: builds UI, communicates with worker, draws canvas
+  const $ = id => document.getElementById(id);
+  const copyPoint = p => ({x: Number(p.x), y: Number(p.y), label: typeof p.label === 'number' ? p.label : Number(p.label) || 0});
+  const clonePoints = arr => (arr || []).map(copyPoint);
+
+  let worker = null;
+  let latestGrid = null;
+  let latestPoints = [];
+  let targetBoundary = null;
+  let renderBoundary = null;
+  let latestHasHidden = false;
+  let currentDataset = [];
+  let currentState = {epoch:0,epochs:0,loss:0};
+  let isPaused = false;
+  let boundaryAnimationId = null;
+  // current moon center Y used to compute delta shifts when moongap changes
+  let currentMoonCenterY = 0.06; // default at gap=0.5 (see baseCenterY in generator)
+
+  const canvas = $('plot');
+  const ctx = canvas.getContext('2d');
+
+  function setPaused(value){
+    isPaused = value;
+    const pauseBtn = $('pauseBtn');
+    if(pauseBtn){
+      pauseBtn.textContent = isPaused ? 'Resume' : 'Pause';
+      pauseBtn.dataset.state = isPaused ? 'resume' : 'pause';
+    }
+  }
+
+  function cancelBoundaryAnimation(){
+    if(boundaryAnimationId !== null){
+      cancelAnimationFrame(boundaryAnimationId);
+      boundaryAnimationId = null;
+    }
+  }
+
+  function startBoundaryAnimation(){
+    if(!targetBoundary){
+      renderBoundary = null;
+      cancelBoundaryAnimation();
+      return;
+    }
+    if(!renderBoundary){
+      renderBoundary = targetBoundary.map(copyPoint);
+    }
+    if(boundaryAnimationId === null){
+      boundaryAnimationId = requestAnimationFrame(boundaryAnimationStep);
+    }
+  }
+
+  function boundaryAnimationStep(){
+    const keepAnimating = smoothBoundaryTowardsTarget();
+    draw();
+    if(keepAnimating){
+      boundaryAnimationId = requestAnimationFrame(boundaryAnimationStep);
+    } else {
+      boundaryAnimationId = null;
+    }
+  }
+
+  function smoothBoundaryTowardsTarget(){
+    if(!targetBoundary || !renderBoundary) return false;
+    if(renderBoundary.length !== targetBoundary.length){
+      renderBoundary = targetBoundary.map(copyPoint);
+      return false;
+    }
+    const alpha = 0.22;
+    let maxDelta = 0;
+    for(let i=0;i<renderBoundary.length;i++){
+      const r = renderBoundary[i];
+      const t = targetBoundary[i];
+      r.x += (t.x - r.x) * alpha;
+      r.y += (t.y - r.y) * alpha;
+      const dx = Math.abs(t.x - r.x);
+      const dy = Math.abs(t.y - r.y);
+      if(dx > maxDelta) maxDelta = dx;
+      if(dy > maxDelta) maxDelta = dy;
+    }
+    return maxDelta > 0.0025;
+  }
+
+  function resizeCanvas(){
+    const container = canvas.parentElement;
+    const maxWidth = 900;
+    const displayWidth = Math.min(container.clientWidth || maxWidth, maxWidth);
+    const displayHeight = Math.round(displayWidth * 0.66);
+    const dpr = window.devicePixelRatio || 1;
+    canvas.style.width = `${displayWidth}px`;
+    canvas.style.height = `${displayHeight}px`;
+    canvas.width = Math.round(displayWidth * dpr);
+    canvas.height = Math.round(displayHeight * dpr);
+    draw();
+  }
+
+  window.addEventListener('resize', resizeCanvas);
+
+  function getDatasetPayload(){
+    return clonePoints(currentDataset);
+  }
+
+  function notifyWorkerData(){
+    if(worker){
+      worker.postMessage({cmd:'setData', points: getDatasetPayload()});
+    }
+  }
+
+  function updateMoonGapVisibility(){
+    const moonControl = $('moongap');
+    if(!moonControl) return;
+    const wrapper = moonControl.closest('label');
+    if(!wrapper) return;
+    const isMoon = $('dataset').value === 'moon';
+    wrapper.style.display = isMoon ? 'block' : 'none';
+    moonControl.disabled = !isMoon;
+    // removed radius/thickness controls; only moongap is shown for moon dataset
+  }
+
+  function createWorker(){
+    if(worker) worker.terminate();
+    cancelBoundaryAnimation();
+    targetBoundary = null;
+    renderBoundary = null;
+    latestGrid = null;
+    const code = workerCode();
+    const blob = new Blob([code],{type:'application/javascript'});
+    worker = new Worker(URL.createObjectURL(blob));
+    worker.onmessage = e => handleWorkerMessage(e.data);
+    return worker;
+  }
+
+  function handleWorkerMessage(msg){
+    if(msg.type === 'update'){
+      currentState.epoch = msg.epoch;
+      currentState.epochs = msg.epochs;
+      currentState.loss = msg.loss;
+      latestGrid = msg.grid;
+      if(msg.points && msg.points.length) latestPoints = clonePoints(msg.points);
+      targetBoundary = msg.boundary ? msg.boundary.map(copyPoint) : null;
+      if(!targetBoundary){
+        renderBoundary = null;
+        cancelBoundaryAnimation();
+      } else {
+        startBoundaryAnimation();
+      }
+      latestHasHidden = !!msg.hasHidden;
+      draw();
+      $('epochInfo').textContent = `Epoch ${msg.epoch}/${msg.epochs}`;
+      $('lossInfo').textContent = `Loss: ${msg.loss.toFixed(4)}`;
+      $('status').textContent = `Epoch: ${msg.epoch}/${msg.epochs}  Loss: ${msg.loss.toFixed(4)}`;
+    } else if(msg.type === 'stopped'){
+      $('status').textContent = 'Stopped';
+      setPaused(false);
+      cancelBoundaryAnimation();
+    }
+  }
+
+  function draw(){
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.width / dpr;
+    const h = canvas.height / dpr;
+    ctx.save();
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    if(!w || !h){ ctx.restore(); return; }
+    // clear
+    ctx.clearRect(0,0,w,h);
+    // base background
+    ctx.fillStyle = '#f4f6f8'; ctx.fillRect(0,0,w,h);
+
+    // if we have a grid from the worker, draw a thin highlighted band where the decision boundary lies
+    if(latestGrid){
+      const cols = latestGrid.cols, rows = latestGrid.rows;
+      const cellW = w/cols, cellH = h/rows;
+      // draw a light overlay only near boundary cells
+      ctx.fillStyle = 'rgba(173, 216, 230, 0.35)'; // light blue overlay
+      for(let r=0;r<rows-1;r++){
+        for(let c=0;c<cols-1;c++){
+          const a = latestGrid.data[r*cols + c].pred;
+          const b = latestGrid.data[r*cols + (c+1)].pred;
+          const d = latestGrid.data[(r+1)*cols + c].pred;
+          if(a!==b || a!==d){
+            ctx.fillRect(c*cellW, r*cellH, cellW, cellH);
+          }
+        }
+      }
+      // faint boundary lines
+      ctx.strokeStyle = 'rgba(60,60,60,0.55)'; ctx.lineWidth = 1; ctx.beginPath();
+      for(let r=0;r<rows-1;r++){
+        for(let c=0;c<cols-1;c++){
+          const a = latestGrid.data[r*cols + c].pred;
+          const b = latestGrid.data[r*cols + (c+1)].pred;
+          const d = latestGrid.data[(r+1)*cols + c].pred;
+          if(a!==b || a!==d){
+            ctx.rect(c*cellW, r*cellH, cellW, cellH);
+          }
+        }
+      }
+      ctx.stroke();
+    }
+
+    // draw points (prefer latestPoints from worker but fall back to generated dataset)
+    const pointsToDraw = (latestPoints && latestPoints.length) ? latestPoints : (currentDataset && currentDataset.length ? currentDataset : []);
+    for(const p of pointsToDraw){
+      const {x,y,label} = p;
+      const px = (x+1.5)/3 * w;
+      const py = (1 - (y+1.5)/3) * h;
+      const col = classColor(label);
+      ctx.beginPath();
+      ctx.fillStyle = `rgb(${col[0]},${col[1]},${col[2]})`;
+      ctx.arc(px,py,4,0,Math.PI*2); ctx.fill();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke();
+    }
+
+    // draw single-line linear boundary if worker provided one and there are no hidden layers
+    const boundaryToDraw = renderBoundary || targetBoundary;
+    if(boundaryToDraw && !latestHasHidden){
+      ctx.save();
+      ctx.strokeStyle = 'rgba(17,24,39,0.85)';
+      ctx.lineWidth = 2;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      for(let i=0;i<boundaryToDraw.length;i++){
+        const bp = boundaryToDraw[i];
+        const bx = (bp.x+1.5)/3 * w;
+        const by = (1 - (bp.y+1.5)/3) * h;
+        if(i===0) ctx.moveTo(bx,by); else ctx.lineTo(bx,by);
+      }
+        // if we have hidden layers, draw an approximate boundary by marking grid boundary cells
+        if(latestHasHidden && latestGrid){
+          const cols = latestGrid.cols, rows = latestGrid.rows;
+          const cellW = w/cols, cellH = h/rows;
+          const pts = [];
+          for(let r=0;r<rows;r++){
+            for(let c=0;c<cols-1;c++){
+              const a = latestGrid.data[r*cols + c].pred;
+              const b = latestGrid.data[r*cols + (c+1)].pred;
+              if(a !== b){
+                // center of the cell seam
+                const x = ((c + 0.5) / cols) * 3 - 1.5;
+                const y = (1 - (r + 0.5)/rows) * 3 - 1.5;
+                pts.push({x,y});
+                break; // one boundary point per row is sufficient for a visual guide
+              }
+            }
+          }
+          if(pts.length){
+            ctx.save();
+            ctx.strokeStyle = 'rgba(17,24,39,0.85)';
+            ctx.lineWidth = 2; ctx.setLineDash([6,4]); ctx.beginPath();
+            for(let i=0;i<pts.length;i++){
+              const bp = pts[i];
+              const bx = (bp.x+1.5)/3 * w; const by = (1 - (bp.y+1.5)/3) * h;
+              if(i===0) ctx.moveTo(bx,by); else ctx.lineTo(bx,by);
+            }
+            ctx.stroke(); ctx.restore();
+          }
+        }
+      ctx.stroke();
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  function classColor(k){
+    const palette = [[200,30,30],[30,120,200],[80,200,80],[200,140,30]];
+    return palette[k % palette.length];
+  }
+
+  // UI actions
+  $('trainBtn').onclick = () => {
+    createWorker();
+    const params = collectParams();
+    setPaused(false);
+    $('status').textContent = 'Training...';
+    worker.postMessage({cmd:'start', params, points: getDatasetPayload()});
+  };
+  $('pauseBtn').onclick = () => {
+    if(!worker) return;
+    if(isPaused){
+      worker.postMessage({cmd:'resume'});
+      setPaused(false);
+      $('status').textContent = 'Resumed';
+    } else {
+      worker.postMessage({cmd:'pause'});
+      setPaused(true);
+      $('status').textContent = 'Paused';
+    }
+  };
+  $('stopBtn').onclick = () => {
+    if(worker) worker.postMessage({cmd:'stop'});
+    setPaused(false);
+    $('status').textContent = 'Stopping...';
+  };
+  $('applyHidden').onclick = () => {
+    if(!worker) createWorker();
+    const params = collectParams();
+    setPaused(false);
+    $('status').textContent = 'Reinitializing...';
+    worker.postMessage({cmd:'applyHidden', params, points: getDatasetPayload()});
+  };
+
+  function collectParams(){
+    const hidden = $('hiddenLayers').value
+      .split(',')
+      .map(s=>s.trim())
+      .filter(s=>s)
+      .map(Number)
+      .filter(n=>Number.isFinite(n) && n>0);
+    return {
+      hiddenLayers: hidden,
+      lr: Number.isFinite(Number($('lr').value)) ? Number($('lr').value) : 0.1,
+      epochs: Math.max(1, Math.floor(Number($('epochs').value) || 200)),
+      pointsPerClass: Math.max(10, Math.floor(Number($('pointsPerClass').value) || 200)),
+      variance: Math.max(0, Number($('variance').value) || 0.25),
+      dataset: $('dataset').value,
+      moongap: Number.isFinite(Number($('moongap').value)) ? Number($('moongap').value) : 0.5
+    };
+  }
+
+  // Generate dataset in main thread so initial view shows points
+  function generateDataMain(p){
+    console.log('generateDataMain called for dataset', p.dataset, 'pointsPerClass', p.pointsPerClass, 'variance', p.variance, 'moongap', p.moongap);
+    const pts = [];
+    const r = Math.max(10, Math.floor(p.pointsPerClass || 200));
+    const varr = Math.max(0, Number(p.variance) || 0.25);
+    const clamp = (v,min,max) => Math.max(min, Math.min(max, v));
+
+    if(p.dataset === 'quadrant'){
+      for(let c=0;c<4;c++){
+        const cx = c%2===0 ? -0.85 : 0.85;
+        const cy = c<2 ? 0.85 : -0.85;
+        for(let i=0;i<r;i++){
+          pts.push({
+            x: clamp(cx + randn()*varr, -1.35, 1.35),
+            y: clamp(cy + randn()*varr, -1.35, 1.35),
+            label: c
+          });
+        }
+      }
+    } else if(p.dataset === 'moon'){
+      // Proper two-moons: two semicircles facing each other using rejection sampling
+      const rawGap = Number.isFinite(p.moongap) ? Number(p.moongap) : 0.5;
+      const gap = clamp(rawGap, 0, 1);
+      const margin = 1.35; // avoid points very near the outer canvas perimeter
+      // Tunable moon shape parameters (fixed values; we removed separate radius/thickness controls)
+      const baseRadius = 0.75;
+      const thickness = Math.max(0.05, varr * 0.45); // small radial variation controlled by variance
+      // Keep horizontal centers constant at default positions; moongap will only affect vertical closeness
+      const centerOffsetX = 0.35; // fixed right/left bias for the two moon halves
+      // Map gap to vertical offset: smaller gap => smaller vertical offset (closer together)
+      // Keep default gap=0.5 producing the permanent default centerOffsetY value (0.06)
+      const baseCenterY = 0.06; // vertical offset when gap=0.5 stays as 0.06
+      const factor = 4; // responsiveness multiplier for gap
+      let centerOffsetY = baseCenterY * (1 + (gap - 0.5) * factor);
+      if(centerOffsetY < 0) centerOffsetY = 0; // don't invert sign
+      const noiseScale = Math.max(0.02, varr * 0.5);
+      // right/top semicircle (label 0) — moved to the right side (user requested)
+      for(let i=0, attempts=0;i<r && attempts < r*50;){
+        attempts++;
+        // sample angle along a semicircle
+        const theta = Math.random() * Math.PI;
+        const radius = baseRadius + (Math.random()-0.5) * thickness;
+        const cx = centerOffsetX;
+        const cy = centerOffsetY;
+        const x = cx + Math.cos(theta) * radius + randn()*noiseScale;
+        const y = cy + Math.sin(theta) * radius + randn()*noiseScale;
+        if(Math.abs(x) <= margin && Math.abs(y) <= margin){
+          pts.push({ x, y, label: 0 });
+          i++;
+        }
+      }
+      // left/bottom semicircle (label 1) — moved to the left side (user requested)
+      for(let i=0, attempts=0;i<r && attempts < r*50;){
+        attempts++;
+        const theta = Math.random() * Math.PI;
+        const radius = baseRadius + (Math.random()-0.5) * thickness;
+        const cx = -centerOffsetX;
+        const cy = -centerOffsetY;
+        const x = cx + Math.cos(theta) * radius + randn()*noiseScale;
+        const y = cy - Math.sin(theta) * radius + randn()*noiseScale;
+        if(Math.abs(x) <= margin && Math.abs(y) <= margin){
+          pts.push({ x, y, label: 1 });
+          i++;
+        }
+      }
+    } else if(p.dataset === 'diagonal'){
+      // Diagonal stripes with safe margins (reject out-of-bounds rather than clamping)
+      const offsets = [0.45, 0, -0.45];
+      const xMin = -0.75;
+      const xMax = 0.75;
+      const noise = Math.max(0.035, varr * 0.4);
+      const margin = 1.35;
+      for(let k=0;k<offsets.length;k++){
+        for(let i=0, attempts=0;i<r && attempts<r*10;){
+          attempts++;
+          const xBase = xMin + Math.random() * (xMax - xMin);
+          const yBase = xBase + offsets[k];
+          const x = xBase + randn() * noise;
+          const y = yBase + randn() * noise;
+          if(Math.abs(x) <= margin && Math.abs(y) <= margin){
+            pts.push({ x, y, label: k });
+            i++;
+          }
+        }
+      }
+    }
+
+    if(pts.length === 0){
+      console.warn('generateDataMain: no points generated for dataset', p.dataset, '— adding minimal fallback sample to avoid empty display');
+      if(p.dataset === 'quadrant'){
+        pts.push({x:-0.85,y:0.85,label:0},{x:0.85,y:0.85,label:1},{x:-0.85,y:-0.85,label:2},{x:0.85,y:-0.85,label:3});
+      } else if(p.dataset === 'moon'){
+        pts.push({x:0.35,y:0.06,label:0},{x:0.45,y:0.1,label:0},{x:-0.35,y:-0.06,label:1},{x:-0.45,y:-0.1,label:1});
+      } else {
+        pts.push({x:-0.5,y:0,label:0},{x:0.5,y:0,label:1});
+      }
+    }
+    currentDataset = clonePoints(pts);
+    latestPoints = clonePoints(pts);
+    updateDebugPanel(p);
+    console.log(`Generated ${currentDataset.length} points for dataset ${p.dataset}`, currentDataset.slice(0,6));
+    // store current center Y so adjusting moongap will shift Y relative to this
+    // only update if centerOffsetY is defined (it's only set for the 'moon' dataset)
+    if(typeof centerOffsetY !== 'undefined') currentMoonCenterY = centerOffsetY;
+    latestGrid = null;
+    targetBoundary = null;
+    renderBoundary = null;
+    cancelBoundaryAnimation();
+    latestHasHidden = false;
+    setPaused(false);
+    draw();
+    notifyWorkerData();
+  }
+
+  function randn(){ let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random(); return Math.sqrt(-2.0*Math.log(u)) * Math.cos(2.0*Math.PI*v); }
+
+  // When moongap changes, only adjust Y positions of existing moon points (do not alter X)
+  function adjustMoonGap(params){
+    if(!params || params.dataset !== 'moon') return;
+    const rawGap = Number.isFinite(params.moongap) ? Number(params.moongap) : 0.5;
+    const gap = Math.max(0, Math.min(1, rawGap));
+    const baseCenterY = 0.06; // corresponds to moongap=0.5
+    const factor = 4;
+    let newCenterY = baseCenterY * (1 + (gap - 0.5) * factor);
+    if(newCenterY < 0) newCenterY = 0;
+    const delta = newCenterY - currentMoonCenterY;
+    console.log('adjustMoonGap', {rawGap: params.moongap, newCenterY, currentMoonCenterY, delta, currentDatasetLength: currentDataset.length});
+    if(Math.abs(delta) < 1e-8) return; // nothing to do
+    // apply delta: top arc (label 0) moves down by +delta, bottom arc (label 1) moves up by +delta
+    for(const p of currentDataset){
+      if(p.label === 0) p.y += delta; else if(p.label === 1) p.y -= delta;
+    }
+    for(const p of latestPoints){
+      if(p.label === 0) p.y += delta; else if(p.label === 1) p.y -= delta;
+    }
+    currentMoonCenterY = newCenterY;
+    draw();
+    updateDebugPanel(params);
+    notifyWorkerData();
+  }
+
+  function updateDebugPanel(p){
+    try{
+      const el = $('debugPanel');
+      if(!el) return;
+      // show which point set is actually drawn
+      const len = (latestPoints && latestPoints.length) ? latestPoints.length : (currentDataset ? currentDataset.length : 0);
+      const mp = p ? (p.moongap || 0) : (collectParams().moongap || 0);
+      el.textContent = `Debug: dataset=${p.dataset || collectParams().dataset} points=${len} moongap=${mp}`;
+    }catch(err){ /* silent */ }
+  }
+
+  // Wire generate/reset and auto-regenerate when dataset changes
+  $('generateBtn').onclick = () => { generateDataMain(collectParams()); };
+  $('resetBtn').onclick = () => {
+    if(worker) worker.terminate();
+    worker = null;
+    latestGrid = null;
+    targetBoundary = null;
+    renderBoundary = null;
+    cancelBoundaryAnimation();
+    setPaused(false);
+    generateDataMain(collectParams());
+    $('status').textContent='Reset';
+  };
+  $('dataset').onchange = () => { updateMoonGapVisibility(); generateDataMain(collectParams()); };
+  // Also redraw/generate on click/focus even if the value doesn't change, so users see data immediately
+  const datasetEl = $('dataset');
+  if(datasetEl){
+    datasetEl.addEventListener('click', (e) => { updateMoonGapVisibility(); generateDataMain(collectParams()); });
+    datasetEl.addEventListener('focus', (e) => { updateMoonGapVisibility(); generateDataMain(collectParams()); });
+    datasetEl.addEventListener('mousedown', (e) => { updateMoonGapVisibility(); generateDataMain(collectParams()); });
+  }
+  $('pointsPerClass').onchange = () => generateDataMain(collectParams());
+  // regenerate on moon control changes so users see the effect immediately
+  const moongapInput = $('moongap');
+  if(moongapInput) moongapInput.oninput = () => adjustMoonGap(collectParams());
+  window.addEventListener('load', ()=>{ resizeCanvas(); updateMoonGapVisibility(); generateDataMain(collectParams()); });
+
+  // Worker code factory (stringifies into blob)
+  function workerCode(){
+    return `
+    // Worker: trains a small MLP and sends grid predictions periodically
+    let params = {};
+    let paused = false;
+    let stopped = false;
+    let weights = null;
+    let points = [];
+    let nClasses = 2;
+    let lastBroadcast = 0;
+    const minBroadcastInterval = 140;
+
+    onmessage = async e => {
+      const m = e.data;
+      if(m.cmd === 'start'){
+        params = m.params; paused=false; stopped=false;
+        points = clonePoints(m.points);
+        nClasses = inferClassCount(points);
+        lastBroadcast = 0;
+        initNetwork(params);
+        await trainLoop();
+      } else if(m.cmd === 'pause'){
+        paused = true;
+      } else if(m.cmd === 'resume'){
+        paused = false;
+      } else if(m.cmd === 'stop'){
+        stopped = true; postMessage({type:'stopped'});
+      } else if(m.cmd === 'setData'){
+        // receive new data without starting training
+        points = clonePoints(m.points || []);
+        nClasses = inferClassCount(points);
+        const grid = buildGrid();
+        const boundary = computeBoundary();
+        postMessage({type:'update', epoch: 0, epochs: params.epochs || 0, loss: 0, grid, points: clonePoints(points), boundary, hasHidden: hasHiddenLayers()});
+      } else if(m.cmd === 'applyHidden'){
+        // update params + reinit network
+        params = m.params || params;
+        points = clonePoints(m.points || points);
+        nClasses = inferClassCount(points);
+        initNetwork(params);
+        const grid = buildGrid();
+        const boundary = computeBoundary();
+        postMessage({type:'update', epoch: 0, epochs: params.epochs || 0, loss: 0, grid, points: clonePoints(points), boundary, hasHidden: hasHiddenLayers()});
+      }
+    }
+
+    function softmax(arr){
+      const maxv = Math.max.apply(null, arr);
+      const exps = arr.map(v => Math.exp(v - maxv));
+      const sum = exps.reduce((s, v) => s + v, 0) || 1e-9;
+      return exps.map(e => e / sum);
+    }
+
+    function forward(inp){
+      let a = Array.from(inp);
+      for(let l=0;l<weights.length;l++){
+        const layer = weights[l];
+        const out = new Float64Array(layer.outDim);
+        for(let j=0;j<layer.outDim;j++){
+          let s = layer.w[j]; // bias
+          for(let i=0;i<layer.inDim;i++) s += layer.w[(i+1)+ j*(layer.inDim+1)] * a[i];
+          if(l < weights.length-1) out[j] = Math.tanh(s);
+          else out[j] = s;
+        }
+        a = Array.from(out);
+      }
+      return a;
+    }
+
+    function predictProbXY(x,y){
+      return softmax(forward([x,y]));
+    }
+
+    function initNetwork(params){
+      const layers = [2].concat(params.hiddenLayers || []).concat([nClasses]);
+      const w = [];
+      for(let l=0;l<layers.length-1;l++){
+        const inDim = layers[l]; const outDim = layers[l+1];
+        const arr = new Float64Array((inDim+1) * outDim);
+        for(let i=0;i<arr.length;i++) arr[i] = (Math.random()*2 - 1) * 0.25;
+        w.push({inDim, outDim, w: arr});
+      }
+      weights = w;
+    }
+
+    function trainLoop(){
+      return new Promise(resolve => {
+        const epochs = params.epochs || 200;
+        let epoch = 0;
+        const lr = params.lr || 0.1;
+        function step(){
+          if(stopped){ resolve(); return; }
+          if(paused){ setTimeout(step, 120); return; }
+          if(points.length === 0){
+            const grid = buildGrid();
+            const boundary = computeBoundary();
+            postMessage({type:'update', epoch, epochs, loss: 0, grid, points: [], boundary, hasHidden: hasHiddenLayers()});
+            resolve();
+            return;
+          }
+          // single epoch SGD pass
+          shuffle(points);
+          let loss = 0;
+          for(const p of points){
+            const x = [p.x, p.y];
+            // forward with saving
+            let a = x.slice();
+            const caches = [];
+            for(let l=0;l<weights.length;l++){
+              const layer = weights[l];
+              const out = new Float64Array(layer.outDim);
+              for(let j=0;j<layer.outDim;j++){
+                let s = layer.w[j];
+                for(let i=0;i<layer.inDim;i++) s += layer.w[(i+1)+ j*(layer.inDim+1)] * a[i];
+                if(l < weights.length-1) out[j] = Math.tanh(s);
+                else out[j] = s;
+              }
+              caches.push({in:a, out:Array.from(out)});
+              a = Array.from(out);
+            }
+            const probs = softmax(a);
+            const target = new Array(probs.length).fill(0); target[p.label]=1;
+            for(let k=0;k<probs.length;k++) loss += - (target[k]*Math.log((probs[k]||1e-9)));
+            // backward (simple gradient step)
+            // compute dL/dout for last layer
+            let delta = probs.map((pp,idx)=> pp - target[idx]);
+            for(let l=weights.length-1;l>=0;l--){
+              const layer = weights[l];
+              const inAct = caches[l].in;
+              // update weights
+              for(let j=0;j<layer.outDim;j++){
+                // bias
+                layer.w[j] -= lr * delta[j];
+                for(let i=0;i<layer.inDim;i++){
+                  const grad = delta[j] * inAct[i];
+                  layer.w[(i+1)+ j*(layer.inDim+1)] -= lr * grad;
+                }
+              }
+              if(l>0){
+                // propagate delta back
+                const prevDelta = new Array(layer.inDim).fill(0);
+                for(let i=0;i<layer.inDim;i++){
+                  let s=0; for(let j=0;j<layer.outDim;j++) s += layer.w[(i+1)+ j*(layer.inDim+1)] * delta[j];
+                  // derivative tanh
+                  const outVal = caches[l-1].out[i];
+                  prevDelta[i] = s * (1 - outVal*outVal);
+                }
+                delta = prevDelta;
+              }
+            }
+          }
+          epoch++;
+          const avgLoss = loss/points.length;
+          const shouldBroadcast = epoch === 1 || epoch % 2 === 0 || epoch === epochs;
+          const now = Date.now();
+          const allowBroadcast = (now - lastBroadcast) >= minBroadcastInterval || epoch === 1 || epoch === epochs;
+          if(shouldBroadcast && allowBroadcast){
+            const grid = buildGrid();
+            const boundary = computeBoundary();
+            const update = {type:'update', epoch, epochs, loss: avgLoss, grid, boundary, hasHidden: hasHiddenLayers()};
+            if(epoch === 1 || epoch === epochs) update.points = clonePoints(points);
+            postMessage(update);
+            lastBroadcast = now;
+          }
+          if(epoch < epochs) setTimeout(step, 60);
+          else {
+            if(!shouldBroadcast || !allowBroadcast){
+              const grid = buildGrid();
+              const boundary = computeBoundary();
+              const update = {type:'update', epoch, epochs, loss: avgLoss, grid, boundary, hasHidden: hasHiddenLayers()};
+              update.points = clonePoints(points);
+              postMessage(update);
+              lastBroadcast = Date.now();
+            }
+            resolve();
+          }
+        }
+        step();
+      });
+    }
+
+    function hasHiddenLayers(){
+      return !!(params.hiddenLayers && params.hiddenLayers.length);
+    }
+
+    function clonePoints(arr){
+      if(!arr) return [];
+      return arr.map(p => ({x: Number(p.x), y: Number(p.y), label: typeof p.label === 'number' ? p.label : Number(p.label) || 0}));
+    }
+
+    function inferClassCount(arr){
+      if(!arr || !arr.length) return 2;
+      let maxLabel = 0;
+      for(const p of arr){
+        const lbl = typeof p.label === 'number' ? p.label : Number(p.label) || 0;
+        if(lbl > maxLabel) maxLabel = lbl;
+      }
+      return maxLabel + 1;
+    }
+
+    function shuffle(a){ for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } }
+
+    function buildGrid(){
+      const cols = 80, rows = 60; // coarse
+      const data = new Array(cols*rows);
+      for(let r=0;r<rows;r++){
+        for(let c=0;c<cols;c++){
+          const x = (c/cols)*3 - 1.5;
+          const y = (1 - r/rows)*3 - 1.5;
+          const probs = predictProbXY(x,y);
+          let pred = 0, pmax = probs[0];
+          for(let k=1;k<probs.length;k++) if(probs[k]>pmax){ pmax=probs[k]; pred=k; }
+          data[r*cols + c] = {pred, prob: pmax};
+        }
+      }
+      return {cols, rows, data};
+    }
+
+    // Compute a numeric decision boundary (list of {x,y}) for binary linear case (no hidden layers)
+    function computeBoundary(){
+      try{
+        const hasHidden = params.hiddenLayers && params.hiddenLayers.length;
+        if(hasHidden) return null;
+        if(nClasses !== 2) return null;
+        const cols = 160;
+        const pts = [];
+        for(let xi=0; xi<cols; xi++){
+          const x = -1.5 + (xi/(cols-1))*3.0;
+          // scan y for sign change of logit0 - logit1
+          let y0 = -1.5, y1 = 1.5;
+          const f0 = forward([x,y0]);
+          const f1 = forward([x,y1]);
+          const v0 = f0[0] - f0[1];
+          const v1 = f1[0] - f1[1];
+          if(isNaN(v0) || isNaN(v1)) continue;
+          if(v0 === 0){ pts.push({x,y:y0}); continue; }
+          if(v0 * v1 > 0) continue; // no sign change
+          // bisection
+          let a = y0, b = y1; let fa = v0, fb = v1;
+          for(let it=0; it<25; it++){
+            const m = 0.5*(a+b);
+            const fm = forward([x,m]);
+            const vm = fm[0] - fm[1];
+            if(Math.abs(vm) < 1e-3) { a = m; break; }
+            if(fa * vm <= 0){ b = m; fb = vm; } else { a = m; fa = vm; }
+          }
+          pts.push({x, y: 0.5*(a+b)});
+        }
+        return pts.length? pts : null;
+      }catch(err){ return null; }
+    }
+
+    `;
+  }
+  </script>
+</body>
+</html>
