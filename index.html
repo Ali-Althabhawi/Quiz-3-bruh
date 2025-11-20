@@ -3,37 +3,42 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Blob Classifer (MLP)</title>
+  <title>Blob Classifier (MLP)</title>
   <style>
     body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;padding:16px;color:#111;background:#f7f8fa;display:flex;justify-content:center}
-    .page{width:100%;max-width:1320px}
+    .page{width:100%;max-width:100%}
     h1{margin:0 0 14px;font-weight:600}
-    .controlsRow{display:flex;flex-direction:column;gap:12px;margin-bottom:12px}
-    .controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;padding:16px;background:#fff;border-radius:14px;box-shadow:0 10px 26px rgba(20,20,40,0.08)}
-    label{display:block;font-size:13px;margin-top:6px}
-    input,select,button{width:100%;padding:6px;margin-top:4px;box-sizing:border-box}
-    canvas{background:#ffffff;border-radius:12px;border:1px solid #e6e9ef;display:block;width:100%;max-width:900px;height:auto;margin:0 auto;box-shadow:0 12px 32px rgba(20,20,40,0.09)}
+    .controlsRow{display:block;margin-bottom:12px}
+    .mainArea{display:grid;grid-template-columns:360px 1fr;gap:16px;align-items:start}
+    .controls{display:flex;flex-direction:column;gap:10px;padding:12px;background:#fff;border-radius:10px;box-shadow:0 8px 18px rgba(20,20,40,0.06)}
+    label{display:block;font-size:12px;margin-top:4px}
+    input,select,button{width:100%;padding:4px;margin-top:4px;box-sizing:border-box}
+    canvas{background:#ffffff;border-radius:10px;border:1px solid #e6e9ef;display:block;width:100%;max-width:100%;height:auto;margin:0 auto;box-shadow:0 10px 24px rgba(20,20,40,0.08)}
     .status{margin:8px 0;font-weight:600;color:#1f2d3d}
     .topbar{grid-column:1/-1;display:flex;justify-content:space-between;align-items:center;margin-top:6px;padding:10px 14px;border-radius:10px;background:#f8fafc;color:#111827;font-weight:600;box-shadow:inset 0 0 0 1px rgba(37,99,235,0.08)}
     .small{font-size:13px;color:#6b7280}
     .controls .buttons{display:flex;gap:8px;flex-wrap:wrap}
     .controls .buttons button{flex:1 1 140px}
-    button{background:#2563eb;color:#fff;border:none;padding:8px 10px;border-radius:6px;cursor:pointer;box-shadow:0 4px 10px rgba(37,99,235,0.12)}
+    button{background:#2563eb;color:#fff;border:none;padding:6px 8px;border-radius:6px;cursor:pointer;box-shadow:0 3px 8px rgba(37,99,235,0.10)}
     button.secondary{background:#fff;color:#374151;border:1px solid #e5e7eb;box-shadow:none}
     input,select{border:1px solid #e5e7eb;border-radius:6px}
+    @media (max-width:900px){
+      .mainArea{grid-template-columns:1fr}
+    }
     @media (max-width:720px){
-      .controls{grid-template-columns:1fr;padding:14px}
+      .controls{padding:10px}
       .topbar{flex-direction:column;align-items:flex-start;gap:6px}
     }
   </style>
 </head>
 <body>
   <div class="page">
-    <h1>Blob Classifer (MLP)</h1>
+    <h1>Blob Classifier (MLP)</h1>
 
     <!-- Controls moved to top -->
-    <div class="controlsRow">
-      <div class="controls">
+    <div class="mainArea">
+      <div class="controlsRow">
+        <div class="controls">
         <label>Hidden layers (comma separated)
           <input id="hiddenLayers" placeholder="e.g. 8,8 or leave empty for none" />
         </label>
@@ -62,8 +67,13 @@
           </select>
         </label>
 
-        <label>Moon gap (0..1 — smaller = more overlap; moves top arc down and bottom arc up, does not change horizontal centers)
-          <input id="moongap" type="number" min="0" max="1" step="0.01" value="0.5" />
+        <label>Moon gap
+          <input id="moongap" type="number" min="-0.25" max="0.25" step="0.01" value="0.25" />
+        </label>
+
+        <label style="display:flex;align-items:center;gap:8px">
+          <input id="bgToggle" type="checkbox" />
+          <span class="small">Color background regions</span>
         </label>
 
         <div class="buttons" style="margin-top:10px">
@@ -86,12 +96,13 @@
           <div id="epochInfo">Epoch 0/0</div>
           <div id="lossInfo">Loss: 0.00</div>
         </div>
+        </div>
       </div>
-    </div>
 
-    <!-- Large graph below controls -->
-    <div>
-      <canvas id="plot" width="960" height="640"></canvas>
+      <!-- Large graph to the right of controls -->
+      <div class="plotColumn" style="display:block">
+        <canvas id="plot" width="800" height="384"></canvas>
+      </div>
     </div>
   </div>
 
@@ -124,6 +135,19 @@
       pauseBtn.textContent = isPaused ? 'Resume' : 'Pause';
       pauseBtn.dataset.state = isPaused ? 'resume' : 'pause';
     }
+  }
+
+  // Enable/disable most controls while training. Keep pause/stop/reset active.
+  function setControlsEnabled(enabled){
+    const ids = ['hiddenLayers','lr','epochs','pointsPerClass','variance','dataset','moongap','bgToggle','applyHidden','generateBtn','trainBtn'];
+    for(const id of ids){
+      const el = $(id);
+      if(!el) continue;
+      if(el.tagName === 'BUTTON' || el.tagName === 'INPUT' || el.tagName === 'SELECT') el.disabled = !enabled;
+    }
+    // ensure pause/stop/reset remain available
+    const keep = ['pauseBtn','stopBtn','resetBtn'];
+    for(const id of keep){ const el = $(id); if(el) el.disabled = false; }
   }
 
   function cancelBoundaryAnimation(){
@@ -180,9 +204,9 @@
 
   function resizeCanvas(){
     const container = canvas.parentElement;
-    const maxWidth = 900;
-    const displayWidth = Math.min(container.clientWidth || maxWidth, maxWidth);
-    const displayHeight = Math.round(displayWidth * 0.66);
+    // make the canvas match the parent container width (no 900px cap)
+    const displayWidth = container.clientWidth || 900;
+    const displayHeight = Math.round(displayWidth * 0.48);
     const dpr = window.devicePixelRatio || 1;
     canvas.style.width = `${displayWidth}px`;
     canvas.style.height = `${displayHeight}px`;
@@ -234,22 +258,30 @@
       currentState.loss = msg.loss;
       latestGrid = msg.grid;
       if(msg.points && msg.points.length) latestPoints = clonePoints(msg.points);
+      // update boundary target and animate towards it (avoid immediate redraw to reduce flicker)
       targetBoundary = msg.boundary ? msg.boundary.map(copyPoint) : null;
       if(!targetBoundary){
         renderBoundary = null;
         cancelBoundaryAnimation();
+        // ensure a single draw to clear
+        draw();
       } else {
         startBoundaryAnimation();
       }
       latestHasHidden = !!msg.hasHidden;
-      draw();
+      // update status text; boundary animation loop will handle rendering
       $('epochInfo').textContent = `Epoch ${msg.epoch}/${msg.epochs}`;
       $('lossInfo').textContent = `Loss: ${msg.loss.toFixed(4)}`;
       $('status').textContent = `Epoch: ${msg.epoch}/${msg.epochs}  Loss: ${msg.loss.toFixed(4)}`;
+      // If this is a non-training update (epoch===0) or training finished, re-enable controls
+      if(msg.epoch === 0 || (msg.epochs && msg.epoch === msg.epochs)){
+        setControlsEnabled(true);
+      }
     } else if(msg.type === 'stopped'){
       $('status').textContent = 'Stopped';
       setPaused(false);
       cancelBoundaryAnimation();
+      setControlsEnabled(true);
     }
   }
 
@@ -269,6 +301,24 @@
     if(latestGrid){
       const cols = latestGrid.cols, rows = latestGrid.rows;
       const cellW = w/cols, cellH = h/rows;
+      // optional background coloring per-class (muted pastels)
+      const bgToggle = $('bgToggle');
+      if(bgToggle && bgToggle.checked){
+        const bgPalette = [
+          'rgba(255,230,230,0.45)',
+          'rgba(230,245,255,0.45)',
+          'rgba(235,255,235,0.45)',
+          'rgba(255,250,230,0.45)'
+        ];
+        for(let r=0;r<rows;r++){
+          for(let c=0;c<cols;c++){
+            const pred = latestGrid.data[r*cols + c].pred;
+            const col = bgPalette[pred % bgPalette.length] || bgPalette[0];
+            ctx.fillStyle = col;
+            ctx.fillRect(c*cellW, r*cellH, cellW, cellH);
+          }
+        }
+      }
       // draw a light overlay only near boundary cells
       ctx.fillStyle = 'rgba(173, 216, 230, 0.35)'; // light blue overlay
       for(let r=0;r<rows-1;r++){
@@ -372,6 +422,8 @@
     const params = collectParams();
     setPaused(false);
     $('status').textContent = 'Training...';
+    // disable most controls while training (keep pause/stop/reset active)
+    setControlsEnabled(false);
     worker.postMessage({cmd:'start', params, points: getDatasetPayload()});
   };
   $('pauseBtn').onclick = () => {
@@ -396,6 +448,8 @@
     const params = collectParams();
     setPaused(false);
     $('status').textContent = 'Reinitializing...';
+    // applying hidden is like reinitializing — disable controls briefly
+    setControlsEnabled(false);
     worker.postMessage({cmd:'applyHidden', params, points: getDatasetPayload()});
   };
 
@@ -426,21 +480,27 @@
     const clamp = (v,min,max) => Math.max(min, Math.min(max, v));
 
     if(p.dataset === 'quadrant'){
+      // Use rejection sampling so quadrant points never sit on the outer canvas perimeter.
+      // This matches the moon/diagonal approach where we explicitly keep points inside a margin.
+      const margin = 1.35;
       for(let c=0;c<4;c++){
         const cx = c%2===0 ? -0.85 : 0.85;
         const cy = c<2 ? 0.85 : -0.85;
-        for(let i=0;i<r;i++){
-          pts.push({
-            x: clamp(cx + randn()*varr, -1.35, 1.35),
-            y: clamp(cy + randn()*varr, -1.35, 1.35),
-            label: c
-          });
+        for(let i=0, attempts=0; i<r && attempts < r*10;){
+          attempts++;
+          const x = cx + randn()*varr;
+          const y = cy + randn()*varr;
+          if(Math.abs(x) <= margin && Math.abs(y) <= margin){
+            pts.push({ x, y, label: c });
+            i++;
+          }
         }
       }
     } else if(p.dataset === 'moon'){
       // Proper two-moons: two semicircles facing each other using rejection sampling
-      const rawGap = Number.isFinite(p.moongap) ? Number(p.moongap) : 0.5;
-      const gap = clamp(rawGap, 0, 1);
+      const rawGap = Number.isFinite(p.moongap) ? Number(p.moongap) : 0.25;
+      // allow negative gaps in range [-0.25, 0.25]
+      const gap = clamp(rawGap, -0.25, 0.25);
       const margin = 1.35; // avoid points very near the outer canvas perimeter
       // Tunable moon shape parameters (fixed values; we removed separate radius/thickness controls)
       const baseRadius = 0.75;
@@ -448,11 +508,15 @@
       // Keep horizontal centers constant at default positions; moongap will only affect vertical closeness
       const centerOffsetX = 0.35; // fixed right/left bias for the two moon halves
       // Map gap to vertical offset: smaller gap => smaller vertical offset (closer together)
-      // Keep default gap=0.5 producing the permanent default centerOffsetY value (0.06)
-      const baseCenterY = 0.06; // vertical offset when gap=0.5 stays as 0.06
+      // New default gap is 0.25. For gaps below 0.25 we apply double sensitivity
+      // so the moons move twice as fast when moving from 0.25 -> 0.
+      const baseCenterY = 0.06; // baseline vertical offset
+      const defaultGap = 0.25; // user-requested default
       const factor = 4; // responsiveness multiplier for gap
-      let centerOffsetY = baseCenterY * (1 + (gap - 0.5) * factor);
-      if(centerOffsetY < 0) centerOffsetY = 0; // don't invert sign
+      // compute delta relative to defaultGap; amplify when gap < defaultGap
+      let gapDelta = gap - defaultGap;
+      if(gap < defaultGap) gapDelta *= 2;
+      let centerOffsetY = baseCenterY * (1 + gapDelta * factor);
       const noiseScale = Math.max(0.02, varr * 0.5);
       // right/top semicircle (label 0) — moved to the right side (user requested)
       for(let i=0, attempts=0;i<r && attempts < r*50;){
@@ -537,12 +601,16 @@
   // When moongap changes, only adjust Y positions of existing moon points (do not alter X)
   function adjustMoonGap(params){
     if(!params || params.dataset !== 'moon') return;
-    const rawGap = Number.isFinite(params.moongap) ? Number(params.moongap) : 0.5;
-    const gap = Math.max(0, Math.min(1, rawGap));
-    const baseCenterY = 0.06; // corresponds to moongap=0.5
+    const rawGap = Number.isFinite(params.moongap) ? Number(params.moongap) : 0.25;
+    // allow negative moongap in [-0.25,0.25]
+    const gap = Math.max(-0.25, Math.min(0.25, rawGap));
+    const baseCenterY = 0.06; // baseline vertical offset
+    const defaultGap = 0.25;
     const factor = 4;
-    let newCenterY = baseCenterY * (1 + (gap - 0.5) * factor);
-    if(newCenterY < 0) newCenterY = 0;
+    // amplify sensitivity when gap < defaultGap so moving 0.25->0 has double effect
+    let gapDelta = gap - defaultGap;
+    if(gap < defaultGap) gapDelta *= 2;
+    let newCenterY = baseCenterY * (1 + gapDelta * factor);
     const delta = newCenterY - currentMoonCenterY;
     console.log('adjustMoonGap', {rawGap: params.moongap, newCenterY, currentMoonCenterY, delta, currentDatasetLength: currentDataset.length});
     if(Math.abs(delta) < 1e-8) return; // nothing to do
@@ -581,6 +649,7 @@
     cancelBoundaryAnimation();
     setPaused(false);
     generateDataMain(collectParams());
+    setControlsEnabled(true);
     $('status').textContent='Reset';
   };
   $('dataset').onchange = () => { updateMoonGapVisibility(); generateDataMain(collectParams()); };
@@ -595,6 +664,9 @@
   // regenerate on moon control changes so users see the effect immediately
   const moongapInput = $('moongap');
   if(moongapInput) moongapInput.oninput = () => adjustMoonGap(collectParams());
+  // background toggle wiring
+  const bgToggle = $('bgToggle');
+  if(bgToggle) bgToggle.addEventListener('change', () => { draw(); });
   window.addEventListener('load', ()=>{ resizeCanvas(); updateMoonGapVisibility(); generateDataMain(collectParams()); });
 
   // Worker code factory (stringifies into blob)
